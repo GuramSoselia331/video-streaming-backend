@@ -10,9 +10,9 @@ export class AppService {
       apiKey: 'l7Q3SWNJxAi3nojVwOE688EBFNq9DN2BojdzMImC8AD',
     });
   }
-  async createStream() {
+  async createStream(name) {
     try {
-      const stream = await this.client.liveStreams.create({ name: 'Test' });
+      const stream = await this.client.liveStreams.create({ name });
       return stream;
     } catch (e) {
       console.error(e);
