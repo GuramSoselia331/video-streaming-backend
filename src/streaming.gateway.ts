@@ -6,7 +6,15 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { spawn, ChildProcess } from 'child_process';
+import { Worker } from 'worker_threads';
+import { join } from 'path';
+
+interface FFmpegWorkerData {
+  worker: Worker;
+  dataBuffer: Buffer[];
+  batchTimeout?: NodeJS.Timeout;
+  canSend: boolean;
+}
 
 @WebSocketGateway({
   cors: {
@@ -19,10 +27,11 @@ export class StreamingGateway
   @WebSocketServer()
   server: Server;
 
-  private ffmpegProcesses: Map<
-    string,
-    { process: ChildProcess; feedStream: boolean }
-  > = new Map();
+  private workers: Map<string, FFmpegWorkerData> = new Map();
+
+  // Batch processing configuration
+  private readonly BATCH_TIMEOUT = 100; // ms
+  private readonly MAX_BATCH_SIZE = 1024 * 1024; // 1MB
 
   handleConnection(client: Socket) {
     client.emit('message', 'Hello from mediarecorder-to-rtmp server!');
@@ -33,126 +42,154 @@ export class StreamingGateway
   }
 
   handleDisconnect(client: Socket) {
-    console.log('socket disconnected!');
     this.stopFFmpeg(client);
-  }
-
-  @SubscribeMessage('config_vcodec')
-  handleConfigVcodec(client: Socket, codec: string): void {
-    if (typeof codec !== 'string' || !/^[0-9a-z]{2,}$/.test(codec)) {
-      client.emit('fatal', 'input codec setup error.');
-      return;
-    }
-    client['_vcodec'] = codec;
   }
 
   @SubscribeMessage('config_rtmpDestination')
   handleConfigRtmpDestination(client: Socket, destination: string): void {
-    if (typeof destination !== 'string') {
-      client.emit('fatal', 'rtmp destination setup error.');
+    if (
+      typeof destination !== 'string' ||
+      !/^rtmps:\/\/[^\s]*$/.test(destination)
+    ) {
+      client.emit('fatal', 'Invalid RTMP destination.');
       return;
     }
-
-    const regexValidator = /^rtmps:\/\/[^\s]*$/;
-    if (!regexValidator.test(destination)) {
-      client.emit('fatal', 'rtmp address rejected.');
-      return;
-    }
-
     client['_rtmpDestination'] = destination;
-    client.emit('message', `rtmp destination set to: ${destination}`);
+    client.emit('message', `RTMP destination set to: ${destination}`);
   }
 
   @SubscribeMessage('start')
   handleStart(client: Socket): void {
-    if (this.ffmpegProcesses.has(client.id)) {
-      client.emit('fatal', 'stream already started.');
+    if (this.workers.has(client.id)) {
+      client.emit('fatal', 'Stream already started.');
       return;
     }
 
     if (!client['_rtmpDestination']) {
-      client.emit('fatal', 'no destination given.');
+      client.emit('fatal', 'No destination given.');
       return;
     }
 
-    const framerate = client.handshake.query.framespersecond;
-    const audioBitrate = parseInt(
-      client.handshake.query.audioBitrate as string,
-    );
-    const audioEncoding = this.getAudioEncoding(audioBitrate);
-
     const ffmpegOptions = this.getFfmpegOptions(
-      framerate,
-      audioBitrate,
-      audioEncoding,
+      client.handshake.query.framespersecond,
+      parseInt(client.handshake.query.audioBitrate as string),
       client['_rtmpDestination'],
     );
 
     try {
-      const ffmpegProcess = spawn('ffmpeg', ffmpegOptions);
+      const worker = new Worker(join(__dirname, 'ffmpeg.worker.js'));
 
-      ffmpegProcess.stderr.on('data', (data) => {
-        client.emit('ffmpeg_stderr', '' + data);
-      });
-
-      ffmpegProcess.on('error', (error) => {
-        console.log('child process error', error);
-        client.emit('fatal', 'ffmpeg error!' + error);
+      worker.on('message', (message) =>
+        this.handleWorkerMessage(client, message),
+      );
+      worker.on('error', (error) => {
+        console.error('Worker error:', error);
+        client.emit('fatal', 'FFmpeg worker error');
         this.stopFFmpeg(client);
       });
 
-      ffmpegProcess.on('exit', (code) => {
-        console.log('child process exit', code);
-        client.emit('fatal', 'ffmpeg exit!' + code);
-        this.stopFFmpeg(client);
+      this.workers.set(client.id, {
+        worker,
+        dataBuffer: [],
+        canSend: true,
       });
 
-      this.ffmpegProcesses.set(client.id, {
-        process: ffmpegProcess,
-        feedStream: true,
-      });
+      worker.postMessage({ type: 'start', options: ffmpegOptions });
     } catch (error) {
       client.emit('fatal', 'Could not start FFmpeg process');
-      this.stopFFmpeg(client);
     }
   }
 
   @SubscribeMessage('binarystream')
-  handleBinaryStream(client: Socket, data: any): void {
-    const ffmpegData = this.ffmpegProcesses.get(client.id);
-    if (!ffmpegData || !ffmpegData.feedStream) {
-      client.emit('fatal', 'rtmp not set yet.');
-      this.stopFFmpeg(client);
+  handleBinaryStream(client: Socket, data: Buffer): void {
+    const workerData = this.workers.get(client.id);
+    if (!workerData) {
+      client.emit('fatal', 'Stream not started.');
       return;
     }
-    ffmpegData.process.stdin.write(data);
+
+    workerData.dataBuffer.push(data);
+
+    // If this is the first chunk in the buffer, start the timeout
+    if (workerData.dataBuffer.length === 1 && workerData.canSend) {
+      workerData.batchTimeout = setTimeout(() => {
+        this.processBatch(client.id);
+      }, this.BATCH_TIMEOUT);
+    }
+
+    // If we've exceeded MAX_BATCH_SIZE, process immediately
+    if (
+      this.getCurrentBatchSize(workerData.dataBuffer) >= this.MAX_BATCH_SIZE &&
+      workerData.canSend
+    ) {
+      clearTimeout(workerData.batchTimeout);
+      this.processBatch(client.id);
+    }
+  }
+
+  private handleWorkerMessage(client: Socket, message: any): void {
+    const workerData = this.workers.get(client.id);
+    if (!workerData) return;
+
+    switch (message.type) {
+      case 'stderr':
+        client.emit('ffmpeg_stderr', message.data);
+        break;
+      case 'error':
+        client.emit('fatal', 'FFmpeg error: ' + message.error);
+        this.stopFFmpeg(client);
+        break;
+      case 'exit':
+        client.emit('fatal', 'FFmpeg process exited with code ' + message.code);
+        this.stopFFmpeg(client);
+        break;
+      case 'backpressure':
+        workerData.canSend = false;
+        break;
+      case 'ready':
+        workerData.canSend = true;
+        this.processBatch(client.id);
+        break;
+    }
+  }
+
+  private processBatch(clientId: string): void {
+    const workerData = this.workers.get(clientId);
+    if (
+      !workerData ||
+      workerData.dataBuffer.length === 0 ||
+      !workerData.canSend
+    )
+      return;
+
+    const batchedData = Buffer.concat(workerData.dataBuffer);
+    workerData.dataBuffer = [];
+    workerData.worker.postMessage({ type: 'data', data: batchedData }, [
+      batchedData.buffer,
+    ]);
+  }
+
+  private getCurrentBatchSize(dataBuffer: Buffer[]): number {
+    return dataBuffer.reduce((total, buffer) => total + buffer.length, 0);
   }
 
   private stopFFmpeg(client: Socket): void {
-    const ffmpegData = this.ffmpegProcesses.get(client.id);
-    if (ffmpegData) {
-      try {
-        ffmpegData.process.stdin.end();
-        ffmpegData.process.kill('SIGINT');
-        console.log('ffmpeg process ended!');
-      } catch (e) {
-        console.warn('killing ffmpeg process attempt failed...', e);
-      }
-      this.ffmpegProcesses.delete(client.id);
+    const workerData = this.workers.get(client.id);
+    if (workerData) {
+      clearTimeout(workerData.batchTimeout);
+      workerData.worker.postMessage({ type: 'stop' });
+      workerData.worker.once('message', (message) => {
+        if (message.type === 'stopped') {
+          workerData.worker.terminate();
+          this.workers.delete(client.id);
+        }
+      });
     }
-  }
-
-  private getAudioEncoding(audioBitrate: number): string {
-    if (audioBitrate === 11025) return '11k';
-    if (audioBitrate === 22050) return '22k';
-    if (audioBitrate === 44100) return '44k';
-    return '64k';
   }
 
   private getFfmpegOptions(
     framerate: any,
     audioBitrate: number,
-    audioEncoding: string,
     destination: string,
   ): string[] {
     const baseOptions = [
@@ -169,7 +206,7 @@ export class StreamingGateway
       '-ar',
       audioBitrate.toString(),
       '-b:a',
-      audioEncoding,
+      this.getAudioEncoding(audioBitrate),
       '-bufsize',
       '5000',
       '-f',
@@ -198,7 +235,9 @@ export class StreamingGateway
         '3',
         ...baseOptions.slice(6),
       ];
-    } else if (framerate === 15) {
+    }
+
+    if (framerate === 15) {
       return [
         ...baseOptions.slice(0, 6),
         '-max_muxing_queue_size',
@@ -224,5 +263,14 @@ export class StreamingGateway
     }
 
     return baseOptions;
+  }
+
+  private getAudioEncoding(audioBitrate: number): string {
+    const bitrateMap: Record<number, string> = {
+      11025: '11k',
+      22050: '22k',
+      44100: '44k',
+    };
+    return bitrateMap[audioBitrate] || '64k';
   }
 }
