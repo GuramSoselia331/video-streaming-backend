@@ -26,6 +26,7 @@ function startFFmpeg(options: string[]) {
     });
 
     ffmpegProcess.on('error', (error) => {
+      console.error('FFmpeg error:', error);
       parentPort?.postMessage({ type: 'error', error: error.message });
     });
 
@@ -35,6 +36,7 @@ function startFFmpeg(options: string[]) {
 
     parentPort?.postMessage({ type: 'started' });
   } catch (error) {
+    console.error(error);
     parentPort?.postMessage({ type: 'error', error: (error as Error).message });
   }
 }
