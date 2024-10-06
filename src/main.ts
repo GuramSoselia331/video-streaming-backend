@@ -2,6 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { IoAdapter } from '@nestjs/platform-socket.io';
 import { spawn } from 'child_process';
+import { RedisIoAdapter } from './redis-io.adapter';
 
 async function bootstrap() {
   // Check for FFmpeg
@@ -11,8 +12,14 @@ async function bootstrap() {
     );
     process.exit(-1);
   });
+
   const app = await NestFactory.create(AppModule);
-  app.useWebSocketAdapter(new IoAdapter(app));
+
+  const redisIoAdapter = new RedisIoAdapter(app);
+  await redisIoAdapter.connectToRedis();
+
+  app.useWebSocketAdapter(redisIoAdapter);
+  // app.useWebSocketAdapter(new IoAdapter(app));
   app.enableCors({ origin: '*' });
   await app.listen(80, '0.0.0.0');
   console.log('Listening at http://localhost:80');
