@@ -53,7 +53,7 @@ export class StreamingGateway
       return;
     }
 
-    const regexValidator = /^rtmp:\/\/[^\s]*$/;
+    const regexValidator = /^rtmps:\/\/[^\s]*$/;
     if (!regexValidator.test(destination)) {
       client.emit('fatal', 'rtmp address rejected.');
       return;
