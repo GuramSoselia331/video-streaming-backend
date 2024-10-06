@@ -1,8 +1,8 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import { IoAdapter } from '@nestjs/platform-socket.io';
 import { spawn } from 'child_process';
 import { RedisIoAdapter } from './redis-io.adapter';
+import * as cookieParser from 'cookie-parser';
 
 async function bootstrap() {
   // Check for FFmpeg
@@ -15,6 +15,7 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule);
 
+  app.use(cookieParser());
   const redisIoAdapter = new RedisIoAdapter(app);
   await redisIoAdapter.connectToRedis();
 
